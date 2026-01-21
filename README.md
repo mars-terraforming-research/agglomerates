@@ -1,4 +1,4 @@
-# Fluffy Clumps
+# Nanorod Agglomerates
 
 A Python tool for generating 3D nanoparticle agglomerates via Brownian collision simulation. Produces STL files suitable for 3D printing, visualization, or further simulation.
 
