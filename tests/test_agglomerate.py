@@ -13,7 +13,9 @@ from agglomerate import (
     random_unit_vector,
     random_point_on_sphere,
     segment_segment_distance,
+    vectorized_segment_distances,
     min_distance_to_agglomerate,
+    min_distance_to_agglomerate_fast,
     check_collision,
     sample_escape_angle,
     calculate_agglomerate_com,
@@ -24,6 +26,9 @@ from agglomerate import (
     write_stl_binary,
     write_stl_ascii,
     calculate_fractal_dimension,
+    _jit_segment_segment_distance,
+    _jit_min_surface_distance,
+    _HAS_NUMBA,
 )
 
 
@@ -427,3 +432,291 @@ class TestIntegration:
             assert file_size == expected_size
         finally:
             os.unlink(filename)
+
+
+class TestVectorizedDistances:
+    """Tests for vectorized segment-segment distance computation."""
+
+    def test_vectorized_matches_scalar_parallel(self):
+        """Vectorized distance matches scalar for parallel segments."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        p2 = np.array([5.0, 0.0, 0.0])
+        d2 = np.array([0.0, 0.0, 1.0])
+        length = 10.0
+
+        scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+        vectorized = vectorized_segment_distances(
+            p1, d1, length, p2.reshape(1, 3), d2.reshape(1, 3), length
+        )[0]
+        assert abs(scalar - vectorized) < 1e-14
+
+    def test_vectorized_matches_scalar_perpendicular(self):
+        """Vectorized distance matches scalar for perpendicular segments."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        p2 = np.array([0.0, 3.0, 0.0])
+        d2 = np.array([1.0, 0.0, 0.0])
+        length = 10.0
+
+        scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+        vectorized = vectorized_segment_distances(
+            p1, d1, length, p2.reshape(1, 3), d2.reshape(1, 3), length
+        )[0]
+        assert abs(scalar - vectorized) < 1e-14
+
+    def test_vectorized_batch(self):
+        """Vectorized handles multiple target segments at once."""
+        np.random.seed(99)
+        p1 = np.random.randn(3) * 100
+        d1 = np.random.randn(3)
+        d1 /= np.linalg.norm(d1)
+
+        N = 50
+        p2_arr = np.random.randn(N, 3) * 100
+        d2_arr = np.random.randn(N, 3)
+        d2_arr /= np.linalg.norm(d2_arr, axis=1, keepdims=True)
+        length = 4000.0
+
+        vectorized = vectorized_segment_distances(p1, d1, length, p2_arr, d2_arr, length)
+        assert vectorized.shape == (N,)
+
+        for i in range(N):
+            scalar = segment_segment_distance(p1, d1, length, p2_arr[i], d2_arr[i], length)
+            assert abs(scalar - vectorized[i]) < 1e-14, f"Mismatch at index {i}"
+
+    def test_vectorized_matches_scalar_random(self):
+        """Vectorized matches scalar on 1000 random segment pairs."""
+        np.random.seed(42)
+        max_diff = 0.0
+
+        for _ in range(1000):
+            p1 = np.random.randn(3) * 1000
+            d1 = np.random.randn(3)
+            d1 /= np.linalg.norm(d1)
+            p2 = np.random.randn(3) * 1000
+            d2 = np.random.randn(3)
+            d2 /= np.linalg.norm(d2)
+            length = 4000.0
+
+            scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+            vectorized = vectorized_segment_distances(
+                p1, d1, length, p2.reshape(1, 3), d2.reshape(1, 3), length
+            )[0]
+            max_diff = max(max_diff, abs(scalar - vectorized))
+
+        assert max_diff < 1e-14
+
+    def test_min_distance_fast_matches_original(self):
+        """Vectorized min distance matches original loop-based version."""
+        np.random.seed(7)
+        rod = Nanorod(np.random.randn(3) * 100, np.array([0.0, 0.0, 1.0]), 100.0, 10.0)
+        agglomerate = []
+        for _ in range(20):
+            d = np.random.randn(3)
+            d /= np.linalg.norm(d)
+            agglomerate.append(Nanorod(np.random.randn(3) * 50, d, 100.0, 10.0))
+
+        original = min_distance_to_agglomerate(rod, agglomerate)
+
+        agg_centers = np.array([r.center for r in agglomerate])
+        agg_directions = np.array([r.direction for r in agglomerate])
+        fast = min_distance_to_agglomerate_fast(
+            rod.center, rod.direction, rod.length, rod.diameter,
+            agg_centers, agg_directions, rod.length, rod.diameter
+        )
+        assert abs(original - fast) < 1e-14
+
+
+class TestJITDistances:
+    """Tests for Numba JIT-compiled distance computation."""
+
+    def test_jit_matches_scalar_basic(self):
+        """JIT distance matches scalar for basic case."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        p2 = np.array([5.0, 0.0, 0.0])
+        d2 = np.array([0.0, 0.0, 1.0])
+        length = 10.0
+
+        scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+        jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+        assert abs(scalar - jit) < 1e-14
+
+    def test_jit_matches_scalar_random(self):
+        """JIT distance matches scalar on 1000 random segment pairs."""
+        np.random.seed(42)
+        max_diff = 0.0
+
+        for _ in range(1000):
+            p1 = np.random.randn(3) * 1000
+            d1 = np.random.randn(3)
+            d1 /= np.linalg.norm(d1)
+            p2 = np.random.randn(3) * 1000
+            d2 = np.random.randn(3)
+            d2 /= np.linalg.norm(d2)
+            length = 4000.0
+
+            scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+            jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+            max_diff = max(max_diff, abs(scalar - jit))
+
+        assert max_diff < 1e-14
+
+    def test_jit_min_surface_distance(self):
+        """JIT min surface distance matches vectorized version."""
+        np.random.seed(7)
+        n = 30
+        rod_center = np.random.randn(3) * 100
+        rod_dir = np.random.randn(3)
+        rod_dir /= np.linalg.norm(rod_dir)
+        length = 100.0
+        diameter = 10.0
+
+        agg_centers = np.random.randn(n, 3) * 50
+        agg_dirs = np.random.randn(n, 3)
+        agg_dirs /= np.linalg.norm(agg_dirs, axis=1, keepdims=True)
+
+        fast = min_distance_to_agglomerate_fast(
+            rod_center, rod_dir, length, diameter,
+            agg_centers, agg_dirs, length, diameter
+        )
+        jit = _jit_min_surface_distance(
+            rod_center, rod_dir, length, diameter,
+            agg_centers, agg_dirs, n
+        )
+        assert abs(fast - jit) < 1e-14
+
+    def test_jit_intersecting_segments(self):
+        """JIT correctly returns zero for intersecting segments."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        p2 = np.array([0.0, 0.0, 0.0])
+        d2 = np.array([1.0, 0.0, 0.0])
+        length = 10.0
+
+        jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+        assert jit < 1e-10
+
+    def test_jit_collinear_segments(self):
+        """JIT handles collinear (overlapping direction) segments."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        p2 = np.array([0.0, 0.0, 20.0])
+        d2 = np.array([0.0, 0.0, 1.0])
+        length = 10.0
+
+        scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+        jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+        assert abs(scalar - jit) < 1e-14
+        # Gap should be 20 - 5 - 5 = 10
+        assert abs(jit - 10.0) < 1e-10
+
+
+class TestAllDistancePathsEquivalent:
+    """Tests that scalar, vectorized, and JIT distance paths produce identical results."""
+
+    def test_three_paths_equivalent_random(self):
+        """All three distance implementations agree on 500 random pairs."""
+        np.random.seed(314)
+
+        for _ in range(500):
+            p1 = np.random.randn(3) * 500
+            d1 = np.random.randn(3)
+            d1 /= np.linalg.norm(d1)
+            p2 = np.random.randn(3) * 500
+            d2 = np.random.randn(3)
+            d2 /= np.linalg.norm(d2)
+            length = np.random.uniform(100, 9000)
+
+            scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+            vectorized = vectorized_segment_distances(
+                p1, d1, length, p2.reshape(1, 3), d2.reshape(1, 3), length
+            )[0]
+            jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+
+            assert abs(scalar - vectorized) < 1e-14, f"scalar vs vectorized: {abs(scalar - vectorized)}"
+            assert abs(scalar - jit) < 1e-14, f"scalar vs jit: {abs(scalar - jit)}"
+
+    def test_three_paths_near_parallel(self):
+        """All paths handle near-parallel segments identically."""
+        p1 = np.array([0.0, 0.0, 0.0])
+        d1 = np.array([0.0, 0.0, 1.0])
+        # Almost parallel, tiny tilt
+        d2 = np.array([1e-8, 0.0, 1.0])
+        d2 /= np.linalg.norm(d2)
+        p2 = np.array([3.0, 0.0, 0.0])
+        length = 4000.0
+
+        scalar = segment_segment_distance(p1, d1, length, p2, d2, length)
+        vectorized = vectorized_segment_distances(
+            p1, d1, length, p2.reshape(1, 3), d2.reshape(1, 3), length
+        )[0]
+        jit = _jit_segment_segment_distance(p1, d1, length, p2, d2, length)
+
+        assert abs(scalar - vectorized) < 1e-14
+        assert abs(scalar - jit) < 1e-14
+
+
+class TestSeedReproducibility:
+    """Tests that seed reproducibility is preserved across all code paths."""
+
+    def test_identical_output_same_seed(self):
+        """Same seed produces bitwise-identical positions and directions."""
+        agg1 = generate_agglomerate(20, 4000.0, 160.0, seed=42, verbose=False)
+        agg2 = generate_agglomerate(20, 4000.0, 160.0, seed=42, verbose=False)
+
+        pos1 = np.array([r.center for r in agg1])
+        pos2 = np.array([r.center for r in agg2])
+        dir1 = np.array([r.direction for r in agg1])
+        dir2 = np.array([r.direction for r in agg2])
+
+        np.testing.assert_array_equal(pos1, pos2)
+        np.testing.assert_array_equal(dir1, dir2)
+
+    def test_different_seed_different_output(self):
+        """Different seeds produce different agglomerates."""
+        agg1 = generate_agglomerate(10, 4000.0, 160.0, seed=1, verbose=False)
+        agg2 = generate_agglomerate(10, 4000.0, 160.0, seed=2, verbose=False)
+
+        pos1 = np.array([r.center for r in agg1])
+        pos2 = np.array([r.center for r in agg2])
+
+        # First rod is always at origin, but subsequent rods should differ
+        assert not np.allclose(pos1[1:], pos2[1:])
+
+    def test_reproducibility_multiple_sizes(self):
+        """Seed reproducibility holds across different clump sizes."""
+        for n in [5, 10, 25]:
+            agg1 = generate_agglomerate(n, 1000.0, 50.0, seed=99, verbose=False)
+            agg2 = generate_agglomerate(n, 1000.0, 50.0, seed=99, verbose=False)
+
+            for r1, r2 in zip(agg1, agg2):
+                np.testing.assert_array_equal(r1.center, r2.center)
+                np.testing.assert_array_equal(r1.direction, r2.direction)
+
+    def test_first_rod_at_origin(self):
+        """First rod is always at origin along z-axis."""
+        for seed in [1, 42, 123, 9999]:
+            agg = generate_agglomerate(5, 100.0, 10.0, seed=seed, verbose=False)
+            np.testing.assert_array_equal(agg[0].center, [0, 0, 0])
+            np.testing.assert_array_equal(agg[0].direction, [0, 0, 1])
+
+    def test_all_rods_contact_agglomerate(self):
+        """Every rod (after the first) is in contact with the agglomerate."""
+        agg = generate_agglomerate(15, 4000.0, 160.0, seed=7, verbose=False)
+        radius = 160.0 / 2.0
+
+        for i in range(1, len(agg)):
+            rod = agg[i]
+            # Check distance to all prior rods
+            min_surface = float('inf')
+            for j in range(i):
+                centerline = segment_segment_distance(
+                    rod.center, rod.direction, rod.length,
+                    agg[j].center, agg[j].direction, agg[j].length
+                )
+                surface = centerline - radius - radius
+                min_surface = min(min_surface, surface)
+            # Should be touching (surface distance <= 0)
+            assert min_surface <= 1e-6, f"Rod {i} not in contact: surface_dist={min_surface}"
