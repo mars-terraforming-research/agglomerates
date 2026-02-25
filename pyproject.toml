@@ -46,4 +46,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: extended paper reproduction tests (deselect with '-m \"not slow\"')",
+]
 

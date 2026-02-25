@@ -80,10 +80,24 @@ These are one-off scripts. They import from `agglomerate.py`, `generate_batch.py
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+# Fast tests only (~10s):
+pytest -m "not slow" -v
+
+# Extended paper reproduction tests (~2 min with numba):
+pytest -m slow -v -s
+
+# Everything:
+pytest -v
 ```
 
-Tests are in `tests/test_agglomerate.py`. They cover the core `agglomerate.py` module (geometry, collisions, generation, mesh, STL output).
+Tests:
+- `tests/test_agglomerate.py` — core unit tests (geometry, collisions, generation, mesh, STL output)
+- `tests/test_paper_trends.py` — fast CI tests for qualitative scaling trends
+- `tests/test_paper_trends_extended.py` — `@pytest.mark.slow` extended tests: mass-radius scaling, 2D box-counting D_f,BC, b-normalization collapse
+
+### Physics note: D_f comparison with paper
+
+The paper's D_f = 1.80 is from **experimental DLCA** (cluster-cluster aggregation) SEM data, not from the simulation. The paper explicitly states its simulation uses particle-cluster aggregation and "does not follow a realistic dynamic process" (page 6). Our simulation (same algorithm) correctly produces D_f ~ 2.0 (3D mass-radius), consistent with particle-cluster DLA for high-aspect-ratio rods. The valid comparison is D_f,BC (2D box-counting from projections), where our ~1.58 matches the paper's Figure 7B.
 
 ## Performance Notes
 
